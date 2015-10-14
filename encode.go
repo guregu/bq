@@ -38,10 +38,10 @@ func Encode(v interface{}) (map[string]bigquery.JsonValue, error) {
 }
 
 func fieldName(field reflect.StructField) string {
-	if name := field.Tag.Get("msg"); name != "" {
+	if name := field.Tag.Get("bq"); name != "" {
 		return name
 	}
-	if name := field.Tag.Get("bq"); name != "" {
+	if name := field.Tag.Get("msg"); name != "" {
 		return name
 	}
 	return field.Name
