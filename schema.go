@@ -17,7 +17,7 @@ func Schema(v interface{}) (*bigquery.TableSchema, error) {
 		if rv.Kind() == reflect.Ptr {
 			return Schema(rv.Elem().Interface())
 		}
-		return bigquery.TableSchema{}, fmt.Errorf("bq schema: unsupported type: %T (%v)", v, rv.Kind())
+		return nil, fmt.Errorf("bq schema: unsupported type: %T (%v)", v, rv.Kind())
 	}
 
 	schema := &bigquery.TableSchema{}
@@ -43,7 +43,7 @@ func Schema(v interface{}) (*bigquery.TableSchema, error) {
 }
 
 // SchemaFromJSON infers a BigQuery schema from the given JSON map.
-func SchemaFromJSON(m map[string]bigquery.JsonValue) (bigquery.TableSchema, error) {
+func SchemaFromJSON(m map[string]bigquery.JsonValue) (*bigquery.TableSchema, error) {
 	schema := &bigquery.TableSchema{}
 	for name, v := range m {
 		fv := reflect.ValueOf(v)
