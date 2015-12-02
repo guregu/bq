@@ -26,7 +26,7 @@ func Schema(v interface{}) (*bigquery.TableSchema, error) {
 		field := rv.Type().Field(i)
 		fv := rv.Field(i)
 
-		name := fieldName(field)
+		name, _ := fieldInfo(field)
 		switch {
 		case !fv.CanInterface(),
 			name == "-":

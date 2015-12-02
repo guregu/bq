@@ -3,6 +3,7 @@ package bq
 import (
 	"fmt"
 	"reflect"
+	"strings"
 
 	"google.golang.org/api/bigquery/v2"
 )
@@ -24,10 +25,14 @@ func Encode(v interface{}) (map[string]bigquery.JsonValue, error) {
 		field := rv.Type().Field(i)
 		fv := rv.Field(i)
 
-		name := fieldName(field)
+		name, special := fieldInfo(field)
 		switch {
 		case !fv.CanInterface(),
 			name == "-":
+			continue
+		}
+
+		if special == "omitempty" && isZero(fv) {
 			continue
 		}
 
@@ -37,12 +42,35 @@ func Encode(v interface{}) (map[string]bigquery.JsonValue, error) {
 	return m, nil
 }
 
-func fieldName(field reflect.StructField) string {
-	if name := field.Tag.Get("bq"); name != "" {
-		return name
+func fieldInfo(field reflect.StructField) (name, special string) {
+	if tag := field.Tag.Get("bq"); tag != "" {
+		return splitTag(tag, field.Name)
 	}
-	if name := field.Tag.Get("msg"); name != "" {
-		return name
+	if tag := field.Tag.Get("msg"); tag != "" {
+		return splitTag(tag, field.Name)
 	}
-	return field.Name
+	return field.Name, ""
+}
+
+func splitTag(tag, fieldName string) (name, special string) {
+	if idx := strings.IndexRune(tag, ','); idx != -1 {
+		if idx == 0 {
+			return fieldName, tag[idx+1:]
+		}
+		return tag[:idx], tag[idx+1:]
+	}
+	if len(tag) > 0 {
+		return tag, ""
+	}
+	return fieldName, ""
+}
+
+func isZero(rv reflect.Value) bool {
+	switch rv.Kind() {
+	case reflect.Func, reflect.Map, reflect.Slice:
+		return rv.IsNil()
+	}
+
+	z := reflect.Zero(rv.Type())
+	return rv.Interface() == z.Interface()
 }
