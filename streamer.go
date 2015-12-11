@@ -14,14 +14,20 @@ import (
 	"google.golang.org/api/googleapi"
 )
 
+const (
+	bufferSize = 500
+)
+
 type Streamer struct {
 	project string
 	dataset string
 	service *bigquery.Service
-	Errors  chan error
 
 	tables map[string]*tableStreamer
-	sync.RWMutex
+	mu     sync.RWMutex // tables mutex
+
+	CreateTables bool
+	Errors       chan error
 }
 
 func NewStreamer(service *bigquery.Service, project, dataset string) *Streamer {
@@ -31,33 +37,34 @@ func NewStreamer(service *bigquery.Service, project, dataset string) *Streamer {
 		dataset: dataset,
 
 		tables: make(map[string]*tableStreamer),
+		Errors: make(chan error, bufferSize),
 	}
 }
 
 func (s *Streamer) Insert(table string, data interface{}) {
-	s.RLock()
+	s.mu.RLock()
 	ts := s.tables[table]
-	s.RUnlock()
+	s.mu.RUnlock()
 
 	if ts == nil {
-		s.Lock()
+		s.mu.Lock()
 		ts = newTableStreamer(s, table)
 		s.tables[table] = ts
 		go ts.run()
-		s.Unlock()
+		s.mu.Unlock()
 	}
 
 	ts.insert(data)
 }
 
 func (s *Streamer) Stop() {
-	s.Lock()
+	s.mu.Lock()
 	for table, ts := range s.tables {
 		close(ts.stop)
 		delete(s.tables, table)
 		ts.flush()
 	}
-	s.Unlock()
+	s.mu.Unlock()
 }
 
 type tableStreamer struct {
@@ -70,8 +77,8 @@ type tableStreamer struct {
 
 	queue []interface{}
 
-	flushDelay time.Duration
-	flushMax   int
+	flushInterval time.Duration
+	flushMax      int
 }
 
 func newTableStreamer(streamer *Streamer, table string) *tableStreamer {
@@ -80,11 +87,11 @@ func newTableStreamer(streamer *Streamer, table string) *tableStreamer {
 		service:  bigquery.NewTabledataService(streamer.service),
 		table:    table,
 
-		incoming: make(chan interface{}, 500),
+		incoming: make(chan interface{}, bufferSize),
 		stop:     make(chan struct{}),
 
-		flushDelay: 10 * time.Second,
-		flushMax:   500,
+		flushInterval: 1 * time.Minute,
+		flushMax:      bufferSize,
 	}
 }
 
@@ -93,15 +100,16 @@ func (ts *tableStreamer) insert(data interface{}) {
 }
 
 func (ts *tableStreamer) run() {
-	timer := time.Tick(ts.flushDelay)
+	tick := time.NewTicker(ts.flushInterval)
+	defer tick.Stop()
 	for {
 		select {
 		case data := <-ts.incoming:
 			ts.queue = append(ts.queue, data)
-			if len(ts.queue) > ts.flushMax {
+			if len(ts.queue) >= ts.flushMax {
 				ts.flush()
 			}
-		case <-timer:
+		case <-tick.C:
 			ts.flush()
 		case <-ts.stop:
 			// should be flushed by Stop
@@ -111,6 +119,8 @@ func (ts *tableStreamer) run() {
 }
 
 func (ts *tableStreamer) flush() {
+	const arbitrarySleepAmount = 10 * time.Second
+
 	if len(ts.queue) == 0 {
 		return
 	}
@@ -138,15 +148,15 @@ func (ts *tableStreamer) flush() {
 
 	// success
 	if err == nil {
-		if len(resp.InsertErrors) == 0 {
-			// fmt.Println("No errors found.")
-		} else {
+		if len(resp.InsertErrors) > 0 {
 			for _, errs := range resp.InsertErrors {
 				for _, err := range errs.Errors {
 					ts.streamer.Errors <- fmt.Errorf("BQ error: %+v", err)
 				}
 			}
 		}
+		// TODO: figure out how to deal w/ row errors
+		// TODO: schema changes...
 		ts.queue = nil
 		return
 	}
@@ -156,13 +166,13 @@ func (ts *tableStreamer) flush() {
 		switch gerr.Code {
 		case 500, 503:
 			// sleep & retry
-			time.Sleep(10 * time.Second)
+			time.Sleep(arbitrarySleepAmount)
 			return
 		}
 	}
 
 	// missing table
-	if isTableNotFoundErr(err) {
+	if ts.streamer.CreateTables && isTableNotFoundErr(err) {
 		schema, _ := Schema(ts.queue[0])
 		tablesService := bigquery.NewTablesService(ts.streamer.service)
 		table := &bigquery.Table{
@@ -179,13 +189,18 @@ func (ts *tableStreamer) flush() {
 			// so try again
 			fmt.Println("Made table, retrying...")
 			ts.flush()
+			time.Sleep(arbitrarySleepAmount)
 			return
 		} else {
 			ts.streamer.Errors <- makeTableErr
+			// try again
+			time.Sleep(arbitrarySleepAmount)
 			return
 		}
 	}
 
+	// some other kind of unexpected error
+	// keep trying
 	if err != nil {
 		ts.streamer.Errors <- err
 	}
