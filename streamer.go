@@ -114,8 +114,6 @@ func (ts *tableStreamer) flush() {
 		return
 	}
 
-	fmt.Println("Flushing...", len(ts.queue))
-
 	// TODO: insertID
 	rows := make([]*bigquery.TableDataInsertAllRequestRows, len(ts.queue))
 	for i, row := range ts.queue {
@@ -139,9 +137,8 @@ func (ts *tableStreamer) flush() {
 
 	// success
 	if err == nil {
-		fmt.Println("Success, inserted", len(ts.queue), "items.")
 		if len(resp.InsertErrors) == 0 {
-			fmt.Println("No errors found.")
+			// fmt.Println("No errors found.")
 		} else {
 			for _, errs := range resp.InsertErrors {
 				for _, err := range errs.Errors {
@@ -155,7 +152,6 @@ func (ts *tableStreamer) flush() {
 
 	// internal errors
 	if gerr, ok := err.(*googleapi.Error); ok {
-		fmt.Println("Google error", gerr)
 		switch gerr.Code {
 		case 500, 503:
 			// sleep & retry
