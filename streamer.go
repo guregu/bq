@@ -55,6 +55,7 @@ func (s *Streamer) Stop() {
 	for table, ts := range s.tables {
 		close(ts.stop)
 		delete(s.tables, table)
+		ts.flush()
 	}
 	s.Unlock()
 }
@@ -103,7 +104,7 @@ func (ts *tableStreamer) run() {
 		case <-timer:
 			ts.flush()
 		case <-ts.stop:
-			ts.flush()
+			// should be flushed by Stop
 			return
 		}
 	}
