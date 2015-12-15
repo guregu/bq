@@ -2,12 +2,15 @@ package bq
 
 import (
 	"fmt"
+	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
 	// "golang.org/x/oauth2/google"
+	"github.com/cenkalti/backoff"
 	"golang.org/x/oauth2/jwt"
 	bigquery "google.golang.org/api/bigquery/v2"
 
@@ -15,7 +18,8 @@ import (
 )
 
 const (
-	bufferSize = 500
+	bufferSize     = 500
+	maxInsertTries = 10
 )
 
 type Streamer struct {
@@ -75,14 +79,16 @@ type tableStreamer struct {
 	incoming chan interface{}
 	stop     chan struct{}
 
-	queue []interface{}
+	queue  []row
+	lastID int64
 
 	flushInterval time.Duration
 	flushMax      int
+	crankiness    *backoff.ExponentialBackOff
 }
 
 func newTableStreamer(streamer *Streamer, table string) *tableStreamer {
-	return &tableStreamer{
+	ts := &tableStreamer{
 		streamer: streamer,
 		service:  bigquery.NewTabledataService(streamer.service),
 		table:    table,
@@ -90,13 +96,42 @@ func newTableStreamer(streamer *Streamer, table string) *tableStreamer {
 		incoming: make(chan interface{}, bufferSize),
 		stop:     make(chan struct{}),
 
-		flushInterval: 1 * time.Minute,
+		flushInterval: 10 * time.Second,
 		flushMax:      bufferSize,
+		crankiness:    backoff.NewExponentialBackOff(),
 	}
+	ts.crankiness.MaxElapsedTime = 0
+	ts.crankiness.InitialInterval = 2 * time.Second
+	ts.crankiness.NextBackOff()
+	return ts
 }
 
 func (ts *tableStreamer) insert(data interface{}) {
 	ts.incoming <- data
+}
+
+type row struct {
+	id    string
+	val   map[string]bigquery.JsonValue
+	iface interface{}
+	tries int
+}
+
+func (ts *tableStreamer) newRow(v interface{}) (row, error) {
+	encoded, err := Encode(v)
+	if err != nil {
+		return row{}, err
+	}
+	return row{
+		id:    strconv.FormatInt(ts.nextID(), 36),
+		val:   encoded,
+		iface: v,
+	}, nil
+}
+
+func (ts *tableStreamer) nextID() int64 {
+	ts.lastID++
+	return ts.lastID
 }
 
 func (ts *tableStreamer) run() {
@@ -105,7 +140,12 @@ func (ts *tableStreamer) run() {
 	for {
 		select {
 		case data := <-ts.incoming:
-			ts.queue = append(ts.queue, data)
+			r, err := ts.newRow(data)
+			if err != nil {
+				ts.streamer.Errors <- err
+				continue
+			}
+			ts.queue = append(ts.queue, r)
 			if len(ts.queue) >= ts.flushMax {
 				ts.flush()
 			}
@@ -119,24 +159,16 @@ func (ts *tableStreamer) run() {
 }
 
 func (ts *tableStreamer) flush() {
-	const arbitrarySleepAmount = 10 * time.Second
-
 	if len(ts.queue) == 0 {
 		return
 	}
 
-	// TODO: insertID
-	rows := make([]*bigquery.TableDataInsertAllRequestRows, len(ts.queue))
-	for i, row := range ts.queue {
-		encoded, err := Encode(row)
-		if err != nil {
-			ts.streamer.Errors <- err
-			continue
-		}
-
-		rows[i] = &bigquery.TableDataInsertAllRequestRows{
-			Json: encoded,
-		}
+	rows := make([]*bigquery.TableDataInsertAllRequestRows, 0, len(ts.queue))
+	for _, row := range ts.queue {
+		rows = append(rows, &bigquery.TableDataInsertAllRequestRows{
+			InsertId: row.id,
+			Json:     row.val,
+		})
 	}
 
 	//  send request
@@ -148,16 +180,26 @@ func (ts *tableStreamer) flush() {
 
 	// success
 	if err == nil {
+		var nextQueue []row
 		if len(resp.InsertErrors) > 0 {
 			for _, errs := range resp.InsertErrors {
 				for _, err := range errs.Errors {
-					ts.streamer.Errors <- fmt.Errorf("BQ error: %+v", err)
+					r := ts.queue[errs.Index]
+					r.tries++
+					if r.tries < maxInsertTries {
+						nextQueue = append(nextQueue, r)
+					} else {
+						ts.streamer.Errors <- fmt.Errorf("BQ insert error: %v", err.Reason)
+					}
 				}
 			}
 		}
 		// TODO: figure out how to deal w/ row errors
 		// TODO: schema changes...
-		ts.queue = nil
+		if len(nextQueue) > 0 {
+			log.Printf("[%s] Sent: %d, Next: %d", ts.table, len(ts.queue), len(nextQueue))
+		}
+		ts.queue = nextQueue
 		return
 	}
 
@@ -166,35 +208,23 @@ func (ts *tableStreamer) flush() {
 		switch gerr.Code {
 		case 500, 503:
 			// sleep & retry
-			time.Sleep(arbitrarySleepAmount)
+			time.Sleep(ts.crankiness.NextBackOff())
 			return
 		}
 	}
 
 	// missing table
 	if ts.streamer.CreateTables && isTableNotFoundErr(err) {
-		schema, _ := Schema(ts.queue[0])
-		tablesService := bigquery.NewTablesService(ts.streamer.service)
-		table := &bigquery.Table{
-			Schema: schema,
-			TableReference: &bigquery.TableReference{
-				ProjectId: ts.streamer.project,
-				DatasetId: ts.streamer.dataset,
-				TableId:   ts.table,
-			},
-		}
-		_, makeTableErr := tablesService.Insert(ts.streamer.project, ts.streamer.dataset, table).Do()
-		if makeTableErr == nil || isAlreadyExistsErr(makeTableErr) {
-			// table exists now (or someone already made it)
-			// so try again
-			fmt.Println("Made table, retrying...")
-			ts.flush()
-			time.Sleep(arbitrarySleepAmount)
+		schema, _ := Schema(ts.queue[0].iface)
+		if makeTableErr := ts.createTable(schema); makeTableErr == nil {
+			wait := ts.crankiness.NextBackOff()
+			log.Printf("Made table %s, retrying after %v...", ts.table, wait)
+			time.Sleep(wait)
 			return
 		} else {
 			ts.streamer.Errors <- makeTableErr
 			// try again
-			time.Sleep(arbitrarySleepAmount)
+			time.Sleep(ts.crankiness.NextBackOff())
 			return
 		}
 	}
@@ -203,7 +233,26 @@ func (ts *tableStreamer) flush() {
 	// keep trying
 	if err != nil {
 		ts.streamer.Errors <- err
+	} else {
+		ts.crankiness.Reset()
 	}
+}
+
+func (ts *tableStreamer) createTable(schema *bigquery.TableSchema) error {
+	tablesService := bigquery.NewTablesService(ts.streamer.service)
+	table := &bigquery.Table{
+		Schema: schema,
+		TableReference: &bigquery.TableReference{
+			ProjectId: ts.streamer.project,
+			DatasetId: ts.streamer.dataset,
+			TableId:   ts.table,
+		},
+	}
+	_, err := tablesService.Insert(ts.streamer.project, ts.streamer.dataset, table).Do()
+	if err == nil || isAlreadyExistsErr(err) {
+		return nil
+	}
+	return err
 }
 
 func NewBigQueryService(c *jwt.Config) (service *bigquery.Service, err error) {
