@@ -49,7 +49,7 @@ func SchemaFromJSON(m map[string]bigquery.JsonValue) (*bigquery.TableSchema, err
 		fv := reflect.ValueOf(v)
 		schema.Fields = append(schema.Fields, &bigquery.TableFieldSchema{
 			Name: name,
-			Type: typeOf(fv),
+			Type: typeOf(fv.Type()),
 		})
 	}
 	return schema, nil
@@ -62,18 +62,18 @@ func fieldType(field reflect.StructField, fv reflect.Value) string {
 	if t := field.Tag.Get("bqtype"); t != "" {
 		return strings.ToUpper(t)
 	}
-	return typeOf(fv)
+	return typeOf(fv.Type())
 }
 
-func typeOf(fv reflect.Value) string {
-	if fv.Kind() == reflect.Ptr {
-		return typeOf(fv.Elem())
+func typeOf(ft reflect.Type) string {
+	if ft.Kind() == reflect.Ptr {
+		return typeOf(ft.Elem())
 	}
 
-	if fv.Type() == timeType {
+	if ft == timeType {
 		return "TIMESTAMP"
 	}
-	switch fv.Kind() {
+	switch ft.Kind() {
 	case reflect.String:
 		return "STRING"
 	case reflect.Int, reflect.Int64, reflect.Int32, reflect.Int16, reflect.Int8:
@@ -85,5 +85,5 @@ func typeOf(fv reflect.Value) string {
 	}
 
 	// TODO: record support
-	panic(fmt.Errorf("bq schema: unsupported type %T: %v", fv.Interface(), fv.Interface()))
+	panic(fmt.Errorf("bq schema: unsupported type %v", ft))
 }

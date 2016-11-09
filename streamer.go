@@ -45,14 +45,14 @@ func NewStreamer(service *bigquery.Service, project, dataset string) *Streamer {
 	}
 }
 
-func (s *Streamer) Insert(table string, data interface{}) {
+func (s *Streamer) Insert(table string, data interface{}, suffix func() string) {
 	s.mu.RLock()
 	ts := s.tables[table]
 	s.mu.RUnlock()
 
 	if ts == nil {
 		s.mu.Lock()
-		ts = newTableStreamer(s, table)
+		ts = newTableStreamer(s, table, suffix)
 		s.tables[table] = ts
 		go ts.run()
 		s.mu.Unlock()
@@ -75,6 +75,7 @@ type tableStreamer struct {
 	streamer *Streamer
 	service  *bigquery.TabledataService
 	table    string
+	suffix   func() string
 
 	incoming chan interface{}
 	stop     chan struct{}
@@ -87,11 +88,12 @@ type tableStreamer struct {
 	crankiness    *backoff.ExponentialBackOff
 }
 
-func newTableStreamer(streamer *Streamer, table string) *tableStreamer {
+func newTableStreamer(streamer *Streamer, table string, suffix func() string) *tableStreamer {
 	ts := &tableStreamer{
 		streamer: streamer,
 		service:  bigquery.NewTabledataService(streamer.service),
 		table:    table,
+		suffix:   suffix,
 
 		incoming: make(chan interface{}, bufferSize),
 		stop:     make(chan struct{}),
@@ -176,6 +178,10 @@ func (ts *tableStreamer) flush() {
 		Kind: "bigquery#tableDataInsertAllRequest",
 		Rows: rows,
 	}
+	if ts.suffix != nil {
+		request.TemplateSuffix = ts.suffix()
+	}
+
 	resp, err := ts.service.InsertAll(ts.streamer.project, ts.streamer.dataset, ts.table, request).Do()
 
 	// success
@@ -207,6 +213,7 @@ func (ts *tableStreamer) flush() {
 	if gerr, ok := err.(*googleapi.Error); ok {
 		switch gerr.Code {
 		case 500, 503:
+			log.Println("BQ: Internal error:", gerr)
 			// sleep & retry
 			time.Sleep(ts.crankiness.NextBackOff())
 			return

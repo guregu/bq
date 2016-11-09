@@ -12,18 +12,26 @@ type testStruct struct {
 	B string `bq:"foo"`
 	C string `bq:"bar,omitempty"`
 	D string `msg:"baz,omitempty"`
+	E int    `msg:"qux,omitempty"`
+	F *int   `msg:",omitempty"`
+	G *int   `msg:",omitempty"`
 }
 
 func TestEncodeOmitEmpty(t *testing.T) {
+	zero := new(int)
 	in := testStruct{
 		A: "hello",
 		B: "",
 		C: "",
 		D: "",
+		E: 1337,
+		F: zero,
 	}
 	expect := map[string]bigquery.JsonValue{
 		"A":   bigquery.JsonValue("hello"),
 		"foo": bigquery.JsonValue(""),
+		"qux": bigquery.JsonValue(1337),
+		"F":   zero,
 	}
 
 	out, err := Encode(in)
@@ -32,6 +40,6 @@ func TestEncodeOmitEmpty(t *testing.T) {
 	}
 
 	if !reflect.DeepEqual(out, expect) {
-		t.Error("bad encode. %v ≠ %v", out, expect)
+		t.Errorf("bad encode. %v ≠ %v", out, expect)
 	}
 }
