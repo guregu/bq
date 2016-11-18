@@ -3,6 +3,8 @@ package bq
 import (
 	"fmt"
 	"log"
+	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +23,12 @@ const (
 	bufferSize     = 15000
 	maxInsertTries = 10
 )
+
+var hostname string
+
+func init() {
+	hostname, _ = os.Hostname()
+}
 
 type Streamer struct {
 	project string
@@ -98,6 +106,8 @@ func newTableStreamer(streamer *Streamer, table string, suffix func() string) *t
 		incoming: make(chan interface{}, bufferSize),
 		stop:     make(chan struct{}),
 
+		lastID: rand.Int63(),
+
 		flushInterval: 10 * time.Second,
 		flushMax:      bufferSize,
 		crankiness:    backoff.NewExponentialBackOff(),
@@ -125,7 +135,7 @@ func (ts *tableStreamer) newRow(v interface{}) (row, error) {
 		return row{}, err
 	}
 	return row{
-		id:    strconv.FormatInt(ts.nextID(), 36),
+		id:    hostname + strconv.FormatInt(ts.nextID(), 36),
 		val:   encoded,
 		iface: v,
 	}, nil
